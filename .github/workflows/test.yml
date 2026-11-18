@@ -1,0 +1,36 @@
+# GitHub Actions：跑单元测试（Windows，和实际运行环境一致）
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # node --test 的 glob 一个文件都没匹配到时也会 exit 0 —— 先卡数量，避免假绿
+      - name: 确认测试文件都在
+        shell: pwsh
+        run: |
+          $count = (Get-ChildItem -Filter "match-*.test.mjs").Count
+          if ($count -lt 5) { throw "只找到 $count 个 JS 测试文件" }
+          if (-not (Test-Path "test_launch_windows.py")) { throw "缺少 Python 测试" }
+
+      - name: JS 单元测试（引擎 / 物理 / 合成 / 榜单 / 设置 / 文案 / 渲染 / 演示）
+        run: node --test "match-*.test.mjs"
+
+      - name: Python 测试（启动器 / 数据桥接入 / MIME / 清理）
+        run: python test_launch_windows.py

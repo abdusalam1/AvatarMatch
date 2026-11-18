@@ -1,0 +1,563 @@
+"""头像撑瓶 · 独立桌面壳（自己的 HTTP 服务 + 自己的 WebView2 窗口与配置目录）。
+
+架构和「头像大乱斗 / 头像打印机」保持一致：
+  · launch.py 起一个只监听 127.0.0.1 的静态服务（钉死 MIME，避免 Windows 把 .mjs 当 text/plain）
+  · 页面通过 /__bridge-status 找到本机的直播数据桥（只读探测，不改动打印项目）
+  · pywebview 开一个独立窗口，配置目录独立，不干扰打印项目的登录态
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import threading
+import time
+import urllib.request
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parent
+
+# 不和头像打印机（8080/8081）、头像大乱斗（8090/8091）抢端口
+DEFAULT_PORTS = (8092, 8093, 8192, 8292, 8392)
+BRIDGE_PORTS = range(8765, 8775)
+
+# ES module 在 Windows 上常被注册表映射成 text/plain，浏览器会拒绝加载：
+# 这里显式钉死类型，不信任本机注册表。
+MIME_TYPES = {
+    '.html': 'text/html; charset=utf-8',
+    '.js': 'text/javascript',
+    '.mjs': 'text/javascript',
+    '.css': 'text/css',
+    '.json': 'application/json',
+    '.txt': 'text/plain; charset=utf-8',
+    '.md': 'text/plain; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml',
+    '.ico': 'image/x-icon',
+    '.wav': 'audio/wav',
+    '.mp3': 'audio/mpeg',
+}
+
+ORIENTATIONS = {
+    'landscape': (1600, 940),
+    'landscape-1080p': (1920, 1080),
+}
+
+_LIVE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+_BRIDGE_CACHE = None
+
+
+def listening(port, timeout=0.3):
+    with socket.socket() as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex(('127.0.0.1', port)) == 0
+
+
+def local_get(url, timeout_s=1.5):
+    # 本机健康检查必须直连：系统代理（Clash 等）会拦掉 127.0.0.1 请求。
+    return _LIVE_OPENER.open(url, timeout=timeout_s)
+
+
+def bridge_status():
+    """找本机的直播数据桥（内置采集器启动后监听 8765 起）。找不到返回 ok=False，页面自动演示。
+
+    先做本地端口探测（毫秒级），只对真在监听的端口发 HTTP；结果缓存 5 秒，
+    避免页面反复轮询时把探测堆起来。
+    """
+    global _BRIDGE_CACHE
+    now = time.monotonic()
+    if _BRIDGE_CACHE and now - _BRIDGE_CACHE[0] < 5:
+        return dict(_BRIDGE_CACHE[1])
+    result = dict(ok=False)
+    for port in BRIDGE_PORTS:
+        if not listening(port, 0.12):
+            continue
+        try:
+            with local_get(f'http://127.0.0.1:{port}/health', 0.8) as response:
+                data = json.load(response)
+            if data.get('service') == 'avatar-printer':
+                result = dict(ok=True, port=port, url=f'ws://127.0.0.1:{port}', room=data.get('room', ''))
+                break
+        except Exception:
+            continue
+    _BRIDGE_CACHE = (now, dict(result))
+    return result
+
+
+ACTIVE_PORT = 0
+BRIDGE_PROC = None
+BRIDGE_ROOM = ''
+LIVE_PROC = None       # 我们打开的直播间浏览器窗口（用于退出时关掉）
+LIVE_CDP_PORT = 9223
+
+BROWSER_CANDIDATES = (
+    r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+    r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+    r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+    r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+)
+
+
+def bridge_dir():
+    """抖音弹幕采集器所在的目录。
+
+    查找顺序：
+      1. 环境变量 MATCH_BRIDGE_DIR（本项目专用，想换成自己的/新版采集器时用）
+      2. 环境变量 ARENA_BRIDGE_DIR（兼容头像大乱斗的写法）
+      3. 本仓库自带的 bridge/（上游 MIT 代码原样内置，开箱即用）
+      4. 同级的 LiveApp/（兼容"配合头像打印机项目一起用"的老用法）
+    """
+    candidates = []
+    for name in ('MATCH_BRIDGE_DIR', 'ARENA_BRIDGE_DIR'):
+        value = os.environ.get(name, '').strip()
+        if value:
+            candidates.append(Path(value))
+    candidates += [ROOT / 'bridge', ROOT.parent / 'LiveApp']
+    for candidate in candidates:
+        try:
+            if (candidate / 'douyin-bridge.mjs').exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def find_browser():
+    for candidate in BROWSER_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def room_id(raw):
+    match = re.fullmatch(r'(?:https?://live\.douyin\.com/)?(\d{5,25})(?:[/?#].*)?', str(raw).strip())
+    return match[1] if match else ''
+
+
+def open_live_room(raw):
+    """开一个独立浏览器窗口进直播间（带远程调试端口，采集器从里面读弹幕）。"""
+    global LIVE_PROC
+    room = room_id(raw)
+    if not room:
+        return dict(ok=False, error='请输入有效的直播间号或链接')
+    if listening(LIVE_CDP_PORT):
+        return dict(ok=True, already=True, room=room)
+    exe = find_browser()
+    if not exe:
+        return dict(ok=False, error='没找到 Edge / Chrome')
+    base = bridge_dir() or ROOT
+    args = [
+        exe,
+        '--app=https://live.douyin.com/' + room,
+        '--window-size=1280,720',
+        '--remote-debugging-port=' + str(LIVE_CDP_PORT),
+        '--remote-debugging-address=127.0.0.1',
+        '--user-data-dir=' + str(base / '.bridge-profile'),
+        '--lang=zh-CN', '--no-first-run', '--no-default-browser-check',
+        '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling',
+        '--disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion',
+    ]
+    try:
+        LIVE_PROC = subprocess.Popen(args)
+    except OSError as exc:
+        return dict(ok=False, error=str(exc))
+    # 等远程调试端口真的起来：Edge/Chrome 已有实例占用同一配置目录时，
+    # 新命令只会被转发给旧实例，调试端口根本不会打开 —— 必须当场报出来。
+    for _ in range(24):
+        if listening(LIVE_CDP_PORT):
+            return dict(ok=True, room=room)
+        time.sleep(0.25)
+    return dict(ok=False,
+                error='直播间窗口没有开起来（远程调试端口 ' + str(LIVE_CDP_PORT) + ' 未监听）。'
+                      '多半是已有一个用同一配置目录的 Edge/Chrome 在跑：'
+                      '请把之前的直播间窗口都关掉，再点一次「打开直播间窗口」')
+
+
+def cdp_pages(port=LIVE_CDP_PORT, timeout=1.5):
+    """列出直播间窗口里的标签页（CDP /json/list）。"""
+    try:
+        with local_get(f'http://127.0.0.1:{port}/json/list', timeout) as response:
+            pages = json.load(response)
+        return [dict(url=p.get('url', ''), title=p.get('title', '')) for p in pages if p.get('type') == 'page']
+    except Exception:
+        return []
+
+
+def wait_for_room_tab(room, timeout=12.0):
+    """等直播间标签页真正打开到 live.douyin.com/<room>（登录跳转、重定向都要等）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for page in cdp_pages():
+            if re.search(r'live\.douyin\.com/' + re.escape(room), page.get('url', '')):
+                return page
+        time.sleep(0.6)
+    return None
+
+
+def bridge_log_tail(lines=8, max_chars=1200):
+    """采集器日志最后几行——排障时最有用的东西。"""
+    base = bridge_dir()
+    if not base:
+        return ''
+    log_path = base / 'desktop-bridge.log'
+    try:
+        if not log_path.exists():
+            return ''
+        with open(log_path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 8192))
+            text = handle.read().decode('utf-8', 'replace')
+        tail = [line for line in text.splitlines() if line.strip()][-lines:]
+        return '\n'.join(tail)[-max_chars:]
+    except OSError:
+        return ''
+
+
+def bridge_stuck_reason():
+    """8765 上有个桥在跑、却一直报"未就绪/采不到"——通常是从前遗留的僵死采集器。"""
+    tail = bridge_log_tail(2).strip()
+    if not tail:
+        return ''
+    last = tail.splitlines()[-1]
+    for marker in ('未就绪', '没找到房间标签页', '连接断开', '失败'):
+        if marker in last:
+            return last
+    return ''
+
+
+def build_diag():
+    """给页面用的一键诊断：桥/窗口/采集器日志。"""
+    status = bridge_status()
+    pages = cdp_pages() if listening(LIVE_CDP_PORT) else []
+    live_tabs = [p['url'] for p in pages if re.search(r'live\.douyin\.com/\d{5,25}', p['url'] or '')]
+    return {
+        'bridge': status,
+        'bridgeFound': bool(bridge_dir()),
+        'bridgeDir': str(bridge_dir() or ''),
+        'bridgeRunning': bool(BRIDGE_PROC and BRIDGE_PROC.poll() is None),
+        'bridgeRoom': BRIDGE_ROOM,
+        'liveWindow': {
+            'listening': listening(LIVE_CDP_PORT),
+            'pages': [p['url'] for p in pages][:6],
+            'liveTabs': live_tabs[:3],
+            'liveTab': bool(live_tabs),
+        },
+        'logTail': bridge_log_tail(),
+    }
+
+
+def start_bridge(raw):
+    """启动直播数据桥（复用内置采集器），等它真正起来再返回。"""
+    global BRIDGE_PROC, BRIDGE_ROOM, _BRIDGE_CACHE
+    room = room_id(raw)
+    if not room:
+        return dict(ok=False, error='请输入有效的直播间号')
+    status = bridge_status()
+    if status.get('ok'):
+        stuck = bridge_stuck_reason()
+        if stuck:
+            return dict(ok=False,
+                        error='8765 端口上已经有一个采集器在空跑（最后一行日志：' + stuck + '）。'
+                              '请先关掉它：在打印项目里点「停止抓取」，或结束那个 node 进程，再点「开始抓取」。')
+        return dict(status, already=True)
+    base = bridge_dir()
+    if not base:
+        return dict(ok=False, error='找不到数据桥；请把 MATCH_BRIDGE_DIR 指向 LiveApp 目录')
+    node = shutil.which('node')
+    if not node:
+        return dict(ok=False, error='没有安装 Node.js')
+    if not listening(LIVE_CDP_PORT):
+        return dict(ok=False, error='请先点「打开直播间窗口」并完成登录，再开始抓取')
+    # 等标签页真正落到 live.douyin.com/<room>；没等到也继续试（采集器会自己找/开标签页）
+    tab = wait_for_room_tab(room)
+    if not tab:
+        current = '、'.join((p.get('url') or '')[:60] for p in cdp_pages()[:3]) or '（读不到标签页）'
+        return dict(ok=False,
+                    error='直播间窗口还没停在 live.douyin.com/' + room + '（当前：' + current + '）'
+                          + '——请在里面完成登录/进入直播间后重试')
+
+    (base / '.bridge-room').write_text(room, encoding='utf-8')
+    log = open(base / 'desktop-bridge.log', 'ab')
+    try:
+        # 注意：这里故意不设 PRINTER_CDP_PORT —— 打印项目自己也不设。
+        # 设了它，采集器就只认那一个端口、且不会再自动找/开直播间标签页。
+        BRIDGE_PROC = subprocess.Popen(
+            [node, str(base / 'douyin-bridge.mjs'), room],
+            cwd=str(base), env=os.environ.copy(), stdout=log, stderr=log,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    except OSError as exc:
+        return dict(ok=False, error=str(exc))
+    finally:
+        log.close()
+    BRIDGE_ROOM = room
+    for _ in range(50):
+        if BRIDGE_PROC.poll() is not None:
+            BRIDGE_PROC = None
+            return dict(ok=False, error='采集器退出了：\n' + bridge_log_tail())
+        _BRIDGE_CACHE = None
+        status = bridge_status()
+        if status.get('ok'):
+            return dict(status, **{'logTail': bridge_log_tail(4)})
+        time.sleep(0.2)
+    return dict(ok=False, error='数据桥启动超时：\n' + bridge_log_tail())
+
+
+def kill_tree(pid, timeout_s=4.0):
+    """结束进程及其子进程（Windows 用 taskkill /T，避免留下孤儿子进程）。"""
+    if not pid:
+        return False
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                           capture_output=True, timeout=timeout_s,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        else:
+            os.kill(pid, 15)
+        return True
+    except Exception:
+        return False
+
+
+def find_bridge_pids():
+    """找出正在跑"本仓库内置数据桥"的 node 进程（残留采集器）。
+
+    只按本目录下的 bridge/douyin-bridge.mjs 精确匹配：
+    不会误伤 LiveApp/头像打印机自己启动的那个采集器。
+    """
+    if os.name != 'nt':
+        return []
+    script = Path(__file__).resolve().parent / 'bridge' / 'douyin-bridge.mjs'
+    if not script.exists():
+        return []
+    script_path = str(script).replace("'", "''")
+    command = (
+        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+        "Where-Object { $_.CommandLine -like '*douyin-bridge.mjs*' -and "
+        "$_.CommandLine -like '*" + script_path + "*' } | "
+        "Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', command],
+                                capture_output=True, text=True, timeout=10,
+                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return [int(line) for line in (result.stdout or '').split() if line.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def stop_bridge(force=False):
+    """停数据桥。
+
+    - 默认只停本程序启动的那个；
+    - force=True 时额外清理"残留采集器"（上次异常退出留下的、还在拽着浏览器窗口的 node 进程），
+      只匹配本目录 bridge/douyin-bridge.mjs，不会误杀打印项目的桥。
+    """
+    global BRIDGE_PROC, BRIDGE_ROOM, _BRIDGE_CACHE
+    proc = BRIDGE_PROC
+    killed = []
+    if proc and proc.poll() is None:
+        kill_tree(proc.pid) or proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        killed.append(proc.pid)
+    BRIDGE_PROC = None
+    BRIDGE_ROOM = ''
+    _BRIDGE_CACHE = None
+    if force:
+        for pid in find_bridge_pids():
+            if pid not in killed and kill_tree(pid):
+                killed.append(pid)
+        _BRIDGE_CACHE = None
+    return dict(ok=True, killed=killed)
+
+
+def close_live_window():
+    """关掉本程序打开的直播间浏览器窗口（自己开的才关，复用别人窗口的不动）。"""
+    global LIVE_PROC
+    proc = LIVE_PROC
+    LIVE_PROC = None
+    if not proc or proc.poll() is not None:
+        return dict(ok=True, killed=[])
+    kill_tree(proc.pid)
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+    return dict(ok=True, killed=[proc.pid])
+
+
+def work_area():
+    """Windows 桌面可用区域（排除任务栏）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            return max(640, rect.right - rect.left), max(480, rect.bottom - rect.top)
+    except Exception:
+        pass
+    return 1280, 800
+
+
+def window_size(area_w, area_h, orient='landscape', margin=40):
+    """窗口尺寸：等比缩放到屏幕可用区域内，保持 16:9 比例。
+
+    早期版本是 width/height 各自独立裁剪，在没有真实桌面尺寸的环境（CI runner、
+    远程会话）里会退化成 1280x800，窗口比例被压扁。这里统一等比缩放。
+    """
+    want_w, want_h = ORIENTATIONS.get(orient, ORIENTATIONS['landscape'])
+    avail_w = max(320, area_w - margin)
+    avail_h = max(320, area_h - margin)
+    scale = min(1.0, avail_w / want_w, avail_h / want_h)
+    width = max(320, int(want_w * scale))
+    height = max(320, int(want_h * scale))
+    if width <= height:      # 极端小屏下按比例回推一次，横屏必须更宽
+        width = max(320, min(avail_w, int(height * want_w / want_h)))
+    return min(width, avail_w), min(height, avail_h)
+
+
+class MatchHandler(SimpleHTTPRequestHandler):
+    extensions_map = {**SimpleHTTPRequestHandler.extensions_map, **MIME_TYPES}
+
+    def __init__(self, *args, directory=None, **kwargs):
+        super().__init__(*args, directory=directory or str(ROOT), **kwargs)
+
+    def end_headers(self):
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        super().end_headers()
+
+    def _guard(self):
+        # 只允许本机页面调用会拉进程的端点：校验 Host 与同源请求头
+        if not str(self.headers.get('Host', '')).startswith('127.0.0.1:' + str(ACTIVE_PORT)):
+            return False
+        return self.headers.get('Sec-Fetch-Site', '') in ('same-origin', 'same-site', '')
+
+    def do_GET(self):
+        if self.path == '/__bridge-status':
+            payload = bridge_status()
+            base = bridge_dir()
+            payload['bridgeDir'] = str(base) if base else ''
+            payload['bridgeFound'] = bool(base)
+            return self._json(200, json.dumps(payload, ensure_ascii=False))
+        if self.path == '/__health':
+            return self._json(200, json.dumps({'ok': True, 'app': 'avatar-match'}, ensure_ascii=False))
+        if self.path.startswith('/__diag'):
+            return self._json(200, json.dumps(build_diag(), ensure_ascii=False))
+        if self.path.startswith('/__open-live'):
+            if not self._guard():
+                return self._json(403, '{"ok":false,"error":"forbidden"}')
+            query = parse_qs(urlparse(self.path).query)
+            payload = open_live_room((query.get('room') or [''])[0])
+            return self._json(200 if payload.get('ok') else 400, json.dumps(payload, ensure_ascii=False))
+        if self.path.startswith('/__start-bridge'):
+            if not self._guard():
+                return self._json(403, '{"ok":false,"error":"forbidden"}')
+            query = parse_qs(urlparse(self.path).query)
+            payload = start_bridge((query.get('room') or [''])[0])
+            return self._json(200 if payload.get('ok') else 500, json.dumps(payload, ensure_ascii=False))
+        if self.path.startswith('/__stop-bridge'):
+            if not self._guard():
+                return self._json(403, '{"ok":false,"error":"forbidden"}')
+            query = parse_qs(urlparse(self.path).query)
+            force = (query.get('force') or ['1'])[0] != '0'
+            return self._json(200, json.dumps(stop_bridge(force=force), ensure_ascii=False))
+        if self.path.startswith('/__close-live'):
+            if not self._guard():
+                return self._json(403, '{"ok":false,"error":"forbidden"}')
+            return self._json(200, json.dumps(close_live_window(), ensure_ascii=False))
+        # 丢掉旧版本缓存带来的条件请求，保证 Ctrl+R 一定拿新文件
+        for header in ('If-Modified-Since', 'If-None-Match'):
+            if header in self.headers:
+                del self.headers[header]
+        return super().do_GET()
+
+    def _json(self, code, body):
+        data = body.encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+def ensure_server(port=None):
+    global ACTIVE_PORT
+    candidates = [port] if port else list(DEFAULT_PORTS)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if listening(candidate):
+            # 已有本项目的服务在跑就直接复用，避免开第二个
+            try:
+                with local_get(f'http://127.0.0.1:{candidate}/__health', 1.2) as response:
+                    if json.load(response).get('app') == 'avatar-match':
+                        ACTIVE_PORT = candidate
+                        return f'http://127.0.0.1:{candidate}/', None
+            except Exception:
+                pass
+            continue
+        handler = partial(MatchHandler, directory=str(ROOT))
+        server = ThreadingHTTPServer(('127.0.0.1', candidate), handler)
+        ACTIVE_PORT = candidate
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return f'http://127.0.0.1:{candidate}/', server
+    raise RuntimeError('没有可用端口，请关闭占用 8092-8392 的程序')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='AvatarMatch (头像撑瓶) desktop shell')
+    parser.add_argument('--orient', default='landscape', choices=['landscape', 'landscape-1080p'])
+    parser.add_argument('--port', type=int, default=0)
+    parser.add_argument('--server-only', action='store_true')
+    args = parser.parse_args()
+
+    url, server = ensure_server(args.port or None)
+    page = url + 'index.html'
+    try:
+        if args.server_only:
+            threading.Event().wait()
+        else:
+            import webview
+            area_w, area_h = work_area()
+            width, height = window_size(area_w, area_h, args.orient)
+            webview.create_window('头像撑瓶 · AvatarMatch', page,
+                width=width, height=height, min_size=(860, 520), background_color='#070910')
+            webview.start(gui='edgechromium', private_mode=False,
+                storage_path=str(ROOT / '.match-webview-profile'))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # 退出时把"我们拉起来的东西"一起收掉：采集器（node）和直播间浏览器窗口。
+        # 不收的话，采集器会变成孤儿进程，关掉直播间窗口它几秒后又自己开回来。
+        try:
+            stop_bridge(force=True)
+        except Exception:
+            pass
+        try:
+            close_live_window()
+        except Exception:
+            pass
+        if server:
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == '__main__':
+    main()

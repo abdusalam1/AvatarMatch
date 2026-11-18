@@ -1,0 +1,385 @@
+import json
+import os
+import socket
+import sys
+import tempfile
+import types
+import unittest
+import urllib.request
+from pathlib import Path
+
+import launch
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
+class BundledBridgeTests(unittest.TestCase):
+    """开箱即用：数据桥必须真的随仓库分发，而不是要求用户再下载别的项目。"""
+
+    def test_bridge_files_are_bundled(self):
+        bridge = launch.ROOT / 'bridge'
+        self.assertTrue((bridge / 'douyin-bridge.mjs').exists())
+        self.assertTrue((bridge / 'bridge-ws.mjs').exists())
+        # MIT 合规：必须保留上游版权声明
+        self.assertTrue((bridge / 'LICENSE').exists())
+        license_text = (bridge / 'LICENSE').read_text(encoding='utf-8')
+        self.assertIn('MIT License', license_text)
+        self.assertIn('志哥AI', license_text)
+
+    def test_bridge_readme_keeps_upstream_credit(self):
+        text = (launch.ROOT / 'bridge' / 'README.md').read_text(encoding='utf-8')
+        self.assertIn('头像打印机', text)
+        self.assertIn('MIT', text)
+        self.assertIn('c3a21d4', text)
+
+    def test_bridge_dir_prefers_bundled(self):
+        saved = {k: os.environ.pop(k, None) for k in ('MATCH_BRIDGE_DIR', 'ARENA_BRIDGE_DIR')}
+        try:
+            self.assertEqual(launch.bridge_dir(), launch.ROOT / 'bridge')
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    os.environ[key] = value
+
+    def test_env_override_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'douyin-bridge.mjs').write_text('// fake', encoding='utf-8')
+            os.environ['MATCH_BRIDGE_DIR'] = tmp
+            try:
+                self.assertEqual(launch.bridge_dir(), Path(tmp))
+            finally:
+                os.environ.pop('MATCH_BRIDGE_DIR', None)
+
+
+class FrontendFilesTests(unittest.TestCase):
+    """单页应用引用的模块必须都在仓库里，别让用户打开是白屏。"""
+
+    def test_index_imports_all_modules(self):
+        html = (launch.ROOT / 'index.html').read_text(encoding='utf-8')
+        for name in ('match-engine.mjs', 'match-render.mjs', 'match-speech.mjs',
+                     'match-bridge.mjs', 'match-leaderboard.mjs', 'match-settings.mjs',
+                     'match-i18n.mjs'):
+            self.assertIn(name, html, f'index.html 没有引用 {name}')
+
+    def test_index_has_demo_and_stage(self):
+        html = (launch.ROOT / 'index.html').read_text(encoding='utf-8')
+        self.assertIn("params.get('demo')", html)
+        self.assertIn('id="stageCanvas"', html)
+        self.assertIn('__match', html)
+
+
+class WindowSizeTests(unittest.TestCase):
+    def test_landscape_fits_work_area(self):
+        width, height = launch.window_size(1920, 1080, 'landscape')
+        self.assertLessEqual(width, 1920)
+        self.assertLessEqual(height, 1080)
+        self.assertGreater(width, height)                  # 横屏必须更宽
+
+    def test_keeps_16_9_ratio(self):
+        for area in ((1920, 1080), (1600, 900), (1366, 768), (1280, 800), (1024, 768)):
+            width, height = launch.window_size(*area, 'landscape')
+            self.assertGreater(width, height)
+            self.assertAlmostEqual(width / height, 1600 / 940, delta=0.06)
+
+    def test_tiny_screen_still_gives_usable_window(self):
+        width, height = launch.window_size(800, 600, 'landscape')
+        self.assertGreaterEqual(width, 320)
+        self.assertGreaterEqual(height, 320)
+        self.assertLessEqual(width, 800)
+        self.assertGreater(width, height)
+
+
+class MimeTests(unittest.TestCase):
+    def test_module_scripts_are_pinned(self):
+        # Windows 注册表常把 .mjs 映射成 text/plain，浏览器会拒绝加载模块
+        self.assertEqual(launch.MIME_TYPES['.mjs'], 'text/javascript')
+        self.assertEqual(launch.MIME_TYPES['.js'], 'text/javascript')
+        self.assertIn('charset=utf-8', launch.MIME_TYPES['.html'])
+
+
+class ServerTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = (launch.bridge_status, launch.bridge_log_tail)
+        # 让 /__bridge-status 立刻返回，不依赖本机有没有数据桥（CI 上更稳更快）
+        launch.bridge_status = lambda: {'ok': False}
+        launch.bridge_log_tail = lambda lines=8, max_chars=1200: ''
+
+    def tearDown(self):
+        launch.bridge_status, launch.bridge_log_tail = self._orig
+
+    def test_server_answers_health_and_bridge_status(self):
+        port = free_port()
+        url, server = launch.ensure_server(port)
+        try:
+            self.assertIsNotNone(server)
+            with urllib.request.urlopen(url + '__health', timeout=10) as response:
+                self.assertEqual(json.load(response)['app'], 'avatar-match')
+            with urllib.request.urlopen(url + '__bridge-status', timeout=10) as response:
+                payload = json.load(response)
+            self.assertIn('ok', payload)
+            self.assertIsInstance(payload['ok'], bool)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_serves_index_and_modules_with_correct_mime(self):
+        port = free_port()
+        url, server = launch.ensure_server(port)
+        try:
+            with urllib.request.urlopen(url + 'index.html', timeout=3) as response:
+                self.assertIn('text/html', response.headers.get('Content-Type', ''))
+                body = response.read(2000).decode('utf-8', 'replace')
+            self.assertIn('<!DOCTYPE html>', body)
+            with urllib.request.urlopen(url + 'match-engine.mjs', timeout=3) as response:
+                self.assertIn('text/javascript', response.headers.get('Content-Type', ''))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class FakeWebview(types.ModuleType):
+    def __init__(self):
+        super().__init__('webview')
+        self.calls = []
+        self.starts = []
+
+    def create_window(self, title, url=None, **kwargs):
+        self.calls.append((title, url, kwargs))
+        return types.SimpleNamespace(title=title, url=url)
+
+    def start(self, func=None, **kwargs):
+        self.starts.append(kwargs)
+
+
+class LaunchTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_work_area = launch.work_area
+        # 固定工作区尺寸，测试不依赖跑测试的机器有没有真实桌面（CI 上尤其重要）
+        launch.work_area = lambda: (1920, 1080)
+
+    def tearDown(self):
+        launch.work_area = self._orig_work_area
+
+    def run_main(self, argv):
+        fake = FakeWebview()
+        argv_backup = sys.argv
+        sys.modules['webview'] = fake
+        sys.argv = ['launch.py'] + argv
+        try:
+            launch.main()
+        finally:
+            sys.argv = argv_backup
+            sys.modules.pop('webview', None)
+        return fake
+
+    def test_default_opens_landscape_page(self):
+        fake = self.run_main([])
+        self.assertEqual(len(fake.calls), 1)
+        title, url, kwargs = fake.calls[0]
+        self.assertIn('撑瓶', title)
+        self.assertTrue(url.endswith('index.html'))
+        self.assertGreater(kwargs['width'], kwargs['height'])
+        self.assertEqual(len(fake.starts), 1)
+
+
+class LiveConnectionTests(unittest.TestCase):
+    """抖音接入链路：房间号解析、直播间窗口、数据桥启动的前置条件。"""
+
+    def setUp(self):
+        self._orig = (launch.bridge_status, launch.listening, launch.bridge_dir,
+                      launch.cdp_pages, launch.wait_for_room_tab,
+                      launch.bridge_log_tail, launch.subprocess.Popen, launch.BRIDGE_PROC)
+
+    def tearDown(self):
+        (launch.bridge_status, launch.listening, launch.bridge_dir,
+         launch.cdp_pages, launch.wait_for_room_tab,
+         launch.bridge_log_tail, launch.subprocess.Popen, launch.BRIDGE_PROC) = self._orig
+
+    def test_room_id_accepts_digits_and_full_link(self):
+        self.assertEqual(launch.room_id('123456789'), '123456789')
+        self.assertEqual(launch.room_id('https://live.douyin.com/123456789?x=1'), '123456789')
+        self.assertEqual(launch.room_id('hello'), '')
+        self.assertEqual(launch.room_id(''), '')
+
+    def test_open_live_rejects_invalid_room_without_spawning(self):
+        result = launch.open_live_room('not-a-room')
+        self.assertFalse(result['ok'])
+        self.assertIn('直播间号', result['error'])
+
+    def test_start_bridge_asks_to_open_live_window_first(self):
+        launch.bridge_status = lambda: {'ok': False}
+        launch.listening = lambda port, timeout=0.3: False
+        launch.bridge_dir = lambda: launch.ROOT
+        result = launch.start_bridge('123456')
+        self.assertFalse(result['ok'])
+        self.assertIn('打开直播间窗口', result['error'])
+
+    def test_start_bridge_explains_missing_bridge(self):
+        launch.bridge_status = lambda: {'ok': False}
+        launch.listening = lambda port, timeout=0.3: True     # 直播间窗口已开
+        launch.bridge_dir = lambda: None
+        result = launch.start_bridge('123456')
+        self.assertFalse(result['ok'])
+        self.assertIn('MATCH_BRIDGE_DIR', result['error'])
+
+    def test_start_bridge_short_circuits_when_already_running(self):
+        launch.bridge_status = lambda: {'ok': True, 'url': 'ws://127.0.0.1:8765', 'port': 8765}
+        launch.bridge_log_tail = lambda lines=2, max_chars=1200: '💬 小鱼干：666'
+        result = launch.start_bridge('123456')
+        self.assertTrue(result['ok'])
+        self.assertTrue(result.get('already'))
+
+    def test_stop_bridge_is_safe_when_idle(self):
+        launch.BRIDGE_PROC = None
+        self.assertTrue(launch.stop_bridge()['ok'])
+
+    def test_main_exit_stops_bridge_and_closes_live_window(self):
+        """回归：退出程序时必须收掉采集器和直播间窗口，
+        否则采集器变孤儿进程，会一直把直播间窗口重新开出来。"""
+        calls = []
+        saved = (launch.stop_bridge, launch.close_live_window, launch.ROOT)
+        launch.stop_bridge = lambda force=False: calls.append(('stop_bridge', force)) or {'ok': True}
+        launch.close_live_window = lambda: calls.append(('close_live_window',)) or {'ok': True}
+        try:
+            fake = FakeWebview()
+            sys.modules['webview'] = fake
+            argv_backup = sys.argv
+            sys.argv = ['launch.py']
+            try:
+                launch.main()
+            finally:
+                sys.argv = argv_backup
+                sys.modules.pop('webview', None)
+        finally:
+            launch.stop_bridge, launch.close_live_window, launch.ROOT = saved
+        self.assertIn(('stop_bridge', True), calls)
+        self.assertIn(('close_live_window',), calls)
+
+    def test_diag_reports_bridge_window_and_log(self):
+        launch.bridge_status = lambda: {'ok': True, 'url': 'ws://127.0.0.1:8765', 'room': '123456'}
+        launch.listening = lambda port, timeout=0.3: True
+        launch.bridge_dir = lambda: None
+        diag = launch.build_diag()
+        self.assertTrue(diag['bridge']['ok'])
+        self.assertIn('liveWindow', diag)
+        self.assertIn('logTail', diag)
+        self.assertFalse(diag['bridgeFound'])
+
+    def test_wait_for_room_tab_accepts_matching_url(self):
+        launch.cdp_pages = lambda port=9223, timeout=1.5: [
+            {'url': 'https://live.douyin.com/123456', 'title': '直播间'}]
+        self.assertTrue(launch.wait_for_room_tab('123456', timeout=0.2))
+        self.assertFalse(launch.wait_for_room_tab('999999', timeout=0.2))
+
+    def test_start_bridge_explains_wrong_live_tab(self):
+        launch.bridge_status = lambda: {'ok': False}
+        launch.listening = lambda port, timeout=0.3: True
+        launch.bridge_dir = lambda: launch.ROOT
+        launch.wait_for_room_tab = lambda room, timeout=12.0: None
+        launch.cdp_pages = lambda port=9223, timeout=1.5: [
+            {'url': 'https://www.douyin.com/', 'title': '抖音'}]
+        result = launch.start_bridge('123456')
+        self.assertFalse(result['ok'])
+        self.assertIn('live.douyin.com/123456', result['error'])
+        self.assertIn('www.douyin.com', result['error'])
+
+    def test_bridge_stuck_reason_detects_retry_loop(self):
+        launch.bridge_log_tail = lambda lines=2, max_chars=1200: '❌ 独立直播窗口未就绪，请完成登录后重新开始抓取，3 秒后重试'
+        self.assertIn('未就绪', launch.bridge_stuck_reason())
+        launch.bridge_log_tail = lambda lines=2, max_chars=1200: '💬 小鱼干：666'
+        self.assertEqual(launch.bridge_stuck_reason(), '')
+
+    def test_start_bridge_reports_stuck_existing_bridge(self):
+        launch.bridge_status = lambda: {'ok': True, 'url': 'ws://127.0.0.1:8765'}
+        launch.bridge_log_tail = lambda lines=2, max_chars=1200: '❌ 独立直播窗口未就绪，请完成登录后重新开始抓取，3 秒后重试'
+        result = launch.start_bridge('123456')
+        self.assertFalse(result['ok'])
+        self.assertIn('空跑', result['error'])
+
+    def test_start_bridge_does_not_force_cdp_env(self):
+        """回归测试：曾把 PRINTER_CDP_PORT 传给采集器，导致它只守一个端口、不再找标签页。"""
+        import tempfile
+        from pathlib import Path as _Path
+        with tempfile.TemporaryDirectory() as tmp:
+            base = _Path(tmp)
+            (base / 'douyin-bridge.mjs').write_text('// fake', encoding='utf-8')
+            launch.listening = lambda port, timeout=0.3: True
+            launch.bridge_dir = lambda: base
+            launch.wait_for_room_tab = lambda room, timeout=12.0: {'url': 'https://live.douyin.com/123456'}
+            calls = {'n': 0}
+
+            def fake_status():
+                calls['n'] += 1
+                return {'ok': False} if calls['n'] == 1 else {'ok': True, 'url': 'ws://127.0.0.1:8765'}
+
+            launch.bridge_status = fake_status
+            captured = {}
+
+            class FakeProc:
+                def poll(self):
+                    return None
+
+            def fake_popen(cmd, **kwargs):
+                captured['cmd'] = [str(c) for c in cmd]
+                captured['env'] = kwargs.get('env') or {}
+                captured['cwd'] = str(kwargs.get('cwd'))
+                return FakeProc()
+
+            launch.subprocess.Popen = fake_popen
+            result = launch.start_bridge('123456')
+            self.assertTrue(result['ok'], result)
+            self.assertNotIn('PRINTER_CDP_PORT', captured['env'])
+            self.assertTrue(any('douyin-bridge.mjs' in part for part in captured['cmd']))
+            self.assertIn('123456', captured['cmd'])
+
+
+class ProcessCleanupTests(unittest.TestCase):
+    """退出/停止时把采集器和直播间窗口一起收掉（孤儿 bridge 会把窗口反复开回来）。"""
+
+    def setUp(self):
+        self._orig = (launch.find_bridge_pids, launch.kill_tree, launch.LIVE_PROC, launch.BRIDGE_PROC)
+        self.killed = []
+        launch.kill_tree = lambda pid, timeout_s=4.0: self.killed.append(pid) or True
+        launch.LIVE_PROC = None
+        launch.BRIDGE_PROC = None
+
+    def tearDown(self):
+        (launch.find_bridge_pids, launch.kill_tree, launch.LIVE_PROC, launch.BRIDGE_PROC) = self._orig
+
+    def test_stop_bridge_force_cleans_leftover_processes(self):
+        launch.find_bridge_pids = lambda: [4242]
+        result = launch.stop_bridge(force=True)
+        self.assertIn(4242, result['killed'])
+        self.assertIn(4242, self.killed)
+
+    def test_stop_bridge_without_force_leaves_leftovers_alone(self):
+        launch.find_bridge_pids = lambda: [4242]
+        result = launch.stop_bridge()
+        self.assertEqual(result['killed'], [])
+        self.assertEqual(self.killed, [])
+
+    def test_close_live_window_is_noop_when_not_opened(self):
+        result = launch.close_live_window()
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['killed'], [])
+
+    def test_close_live_window_kills_tracked_browser(self):
+        class FakeProc:
+            pid = 999
+            def poll(self):
+                return None
+            def wait(self, timeout=None):
+                return 0
+
+        launch.LIVE_PROC = FakeProc()
+        result = launch.close_live_window()
+        self.assertEqual(result['killed'], [999])
+        self.assertIsNone(launch.LIVE_PROC)
+
+
+if __name__ == '__main__':
+    unittest.main()

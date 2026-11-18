@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>头像撑瓶 · AvatarMatch</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%A7%83%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #070910;
+    --panel: #0f141f;
+    --panel2: #151c2b;
+    --line: #222c40;
+    --text: #eef3ff;
+    --muted: #93a3bd;
+    --accent: #ffd166;
+    --hot: #ff4d6d;
+    --ok: #7ee7c7;
+    --cyan: #8fe9ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: radial-gradient(900px 520px at 78% -12%, #152038, #070910 62%);
+    color: var(--text);
+    font: 14px/1.5 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  button, input { font: inherit; color: inherit; }
+  .app { display: flex; height: 100vh; }
+  aside.panel {
+    width: 354px; flex: none; display: flex; flex-direction: column; gap: 10px;
+    padding: 14px 12px 18px; overflow-y: auto; border-right: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(13,18,29,.94), rgba(8,11,18,.96));
+  }
+  aside.panel::-webkit-scrollbar { width: 8px; }
+  aside.panel::-webkit-scrollbar-thumb { background: #263149; border-radius: 8px; }
+  main.stage { flex: 1; min-width: 0; position: relative; background: #05070c; }
+  canvas#stageCanvas { display: block; width: 100%; height: 100%; }
+
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand .logo {
+    width: 40px; height: 40px; border-radius: 12px; flex: none; display: grid; place-items: center;
+    font-size: 22px; background: linear-gradient(140deg, #ff4d6d, #8b5cf6 55%, #22d3ee);
+    box-shadow: 0 6px 18px rgba(139,92,246,.35);
+  }
+  .brand h1 { margin: 0; font-size: 20px; letter-spacing: .5px; }
+  .brand p { margin: 1px 0 0; font-size: 11px; color: var(--muted); }
+  .brand-actions { margin-left: auto; display: flex; gap: 6px; }
+  .brand-actions button { padding: 5px 9px; font-size: 11.5px; border-radius: 8px; }
+  .brand-actions button.on { color: #08111a; background: linear-gradient(180deg, #ffe6a8, #ffd166); border-color: #ffd166; }
+
+  .statusline { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #46536b; flex: none; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
+  .dot.warn { background: var(--accent); }
+  .dot.bad { background: var(--hot); }
+  .badge {
+    margin-left: auto; font-size: 11px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); background: rgba(255,255,255,.03);
+  }
+  .badge.live { color: var(--ok); border-color: rgba(126,231,199,.45); }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 11px 12px 12px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .card summary {
+    cursor: pointer; font-size: 12px; letter-spacing: .6px; color: var(--accent);
+    text-transform: uppercase; list-style: none; display: flex; align-items: center; gap: 6px;
+  }
+  .card summary::-webkit-details-marker { display: none; }
+  .card summary::after { content: '▾'; margin-left: auto; color: var(--muted); font-size: 11px; }
+  .card[open] summary::after { content: '▴'; }
+  .card summary::before { content: ''; width: 3px; height: 12px; border-radius: 2px; background: linear-gradient(180deg, #ff4d6d, #8b5cf6); }
+  .card h2 {
+    margin: 0 0 2px; font-size: 12px; letter-spacing: .6px; color: var(--accent);
+    text-transform: uppercase; display: flex; align-items: center; gap: 6px;
+  }
+  .card h2::before { content: ''; width: 3px; height: 12px; border-radius: 2px; background: linear-gradient(180deg, #ff4d6d, #8b5cf6); }
+  .row { display: flex; gap: 7px; }
+  .row > * { flex: 1; min-width: 0; }
+  button {
+    cursor: pointer; border: 1px solid var(--line); border-radius: 9px; background: var(--panel2);
+    padding: 8px 10px; font-size: 12.5px; transition: .15s; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  button:hover { transform: translateY(-1px); border-color: #3a4a6b; }
+  button:active { transform: translateY(0); }
+  button.primary { background: linear-gradient(180deg, #ffd166, #f0a92e); color: #191207; border-color: #ffd166; font-weight: 700; }
+  button.hot { background: linear-gradient(180deg, #ff6b81, #e23b56); color: #fff; border-color: #ff6b81; }
+  button.ghost { background: transparent; color: var(--muted); }
+  input[type="text"], input[type="search"] {
+    width: 100%; background: #0a0e17; border: 1px solid var(--line); border-radius: 9px;
+    padding: 8px 10px; font-size: 12.5px; outline: none;
+  }
+  input[type="text"]:focus { border-color: #4a5d84; box-shadow: 0 0 0 3px rgba(139,92,246,.14); }
+
+  .hint { margin: 0; font-size: 11.5px; color: var(--muted); white-space: pre-line; line-height: 1.55; }
+  .hint.ok { color: var(--ok); }
+  .hint.warn { color: var(--accent); }
+  .hint.bad { color: var(--hot); }
+
+  /* 调参面板 */
+  .match-setting-row { display: flex; flex-direction: column; gap: 3px; }
+  .match-setting-head { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--muted); }
+  .match-setting-head b { color: var(--accent); font-weight: 700; }
+  input[type="range"] { width: 100%; accent-color: #ff4d6d; height: 16px; }
+  input[type="checkbox"] { accent-color: #7ee7c7; width: 15px; height: 15px; }
+  .match-setting-note { margin: 2px 0 0; font-size: 11px; color: #6d7c96; line-height: 1.5; }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .stat { background: #0a0e17; border: 1px solid var(--line); border-radius: 9px; padding: 6px 8px; }
+  .stat b { display: block; font-size: 16px; color: var(--cyan); font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 10.5px; color: var(--muted); }
+
+  ul.feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 132px; overflow: hidden; }
+  ul.feed li { font-size: 11.5px; color: #c9d6ee; line-height: 1.35; display: flex; gap: 6px; }
+  ul.feed li i { width: 5px; height: 5px; border-radius: 50%; margin-top: 6px; flex: none; background: var(--cyan); }
+  ul.feed li.hot i { background: var(--hot); }
+  ul.feed li.gold i { background: var(--accent); }
+  ul.feed li.dim { color: #6d7c96; }
+
+  .help p { margin: 0; font-size: 11.5px; color: var(--muted); line-height: 1.55; }
+  .help b { color: var(--text); }
+
+  .stage-note {
+    position: absolute; left: 10px; bottom: 8px; font-size: 10px; color: rgba(160,180,210,.35);
+    pointer-events: none; letter-spacing: .5px;
+  }
+
+  @media (max-width: 1080px) {
+    .app { flex-direction: column; }
+    aside.panel { width: auto; max-height: 46vh; border-right: 0; border-bottom: 1px solid var(--line); }
+    main.stage { min-height: 54vh; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="panel">
+    <header class="brand">
+      <div class="logo">🧃</div>
+      <div>
+        <h1 data-i18n="app.title">头像撑瓶</h1>
+        <p data-i18n="app.subtitle">AvatarMatch</p>
+      </div>
+      <div class="brand-actions">
+        <button id="btnLang" title="中文 / English">中 / EN</button>
+        <button id="btnVoice">播报开</button>
+      </div>
+    </header>
+
+    <div class="statusline">
+      <span class="dot" id="bridgeDot"></span>
+      <b id="bridgeState">—</b>
+      <span class="badge" id="modeBadge">演示模式</span>
+    </div>
+
+    <section class="card">
+      <h2 data-i18n="panel.live"></h2>
+      <input id="room" type="text" data-i18n-ph="field.room.ph" autocomplete="off" spellcheck="false">
+      <div class="row">
+        <button id="btnOpenLive" class="primary" data-i18n="btn.openLive"></button>
+        <button id="btnStartBridge" data-i18n="btn.startBridge"></button>
+      </div>
+      <div class="row">
+        <button id="btnStopBridge" data-i18n="btn.stopBridge"></button>
+        <button id="btnCloseLive" data-i18n="btn.closeLive"></button>
+      </div>
+      <div class="row">
+        <button id="btnSaveRoom" class="ghost" data-i18n="btn.saveRoom"></button>
+        <button id="btnDiag" class="ghost" data-i18n="btn.diag"></button>
+      </div>
+      <p class="hint" id="liveHint"></p>
+    </section>
+
+    <details class="card" id="paramsCard">
+      <summary data-i18n="panel.params"></summary>
+      <div id="settingsBody"></div>
+    </details>
+
+    <section class="card">
+      <h2 data-i18n="panel.data"></h2>
+      <div class="stat-grid" id="dataGrid"></div>
+      <div class="row">
+        <button id="btnClear" data-i18n="btn.clear"></button>
+        <button id="btnBurst" class="hot" data-i18n="btn.burst"></button>
+      </div>
+      <div class="row">
+        <button id="btnFullscreen" class="ghost" data-i18n="btn.fullscreen"></button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 data-i18n="panel.events"></h2>
+      <ul class="feed" id="events"></ul>
+    </section>
+
+    <details class="card help">
+      <summary data-i18n="panel.help"></summary>
+      <p data-i18n="help.like"></p>
+      <p data-i18n="help.comment"></p>
+      <p data-i18n="help.gift"></p>
+      <p data-i18n="help.merge"></p>
+      <p data-i18n="help.combo"></p>
+      <p data-i18n="help.burst"></p>
+    </details>
+  </aside>
+
+  <main class="stage" id="stage">
+    <canvas id="stageCanvas"></canvas>
+  </main>
+</div>
+
+<script type="module">
+import { MatchEngine, makeRng } from './match-engine.mjs';
+import { MatchRender } from './match-render.mjs';
+import { MatchSpeech } from './match-speech.mjs';
+import { DemoFeed, connectBridge, DEMO_NAMES } from './match-bridge.mjs';
+import { BurstBoard } from './match-leaderboard.mjs';
+import { t } from './match-i18n.mjs';
+import {
+  sanitizeMatchSettings, serializeMatchSettings,
+  applyMatchSettings, renderMatchSettings
+} from './match-settings.mjs';
+
+// ---------- 基础 ----------
+const $ = (id) => document.getElementById(id);
+const canvas = $('stageCanvas');
+const SETTINGS_KEY = 'matchSettings';
+const BOARD_KEY = 'matchBurstBoard';
+const ROOM_KEY = 'matchRoom';
+const params = new URLSearchParams(location.search);
+const FORCED_DEMO = params.get('demo') === '1';
+const SHOT = params.get('shot') === '1';
+
+function readJSON(key) {
+  try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; }
+}
+function writeJSON(key, value) {
+  try { localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value)); } catch { /* 隐私模式 */ }
+}
+
+let settings = sanitizeMatchSettings(readJSON(SETTINGS_KEY));
+if (params.get('lang') === 'en') settings.lang = 'en';
+const tr = (key, vars) => t(settings.lang, key, vars);
+const tierName = (tier) => tr('tier.' + Math.min(12, Math.max(1, Math.round(tier) || 1)));
+
+const engine = new MatchEngine({ rng: Math.random });
+const render = new MatchRender(canvas, { t: tr, lang: settings.lang });
+const speech = new MatchSpeech({ lang: settings.lang });
+const board = new BurstBoard({
+  storage: {
+    read: () => localStorage.getItem(BOARD_KEY),
+    write: (v) => writeJSON(BOARD_KEY, v)
+  }
+});
+const demo = new DemoFeed(engine, { rate: settings.demoRate, onEvent: onBridgeEvent });
+
+let bridge = null;
+let bridgeLive = false;
+let feedItems = [];
+let lastUi = 0;
+let toastGate = new Map();
+
+// ---------- 设置 ----------
+function saveSettings() {
+  writeJSON(SETTINGS_KEY, serializeMatchSettings(settings));
+  pullSettings();
+}
+function pullSettings() {
+  applyMatchSettings(settings, engine);
+  speech.enabled = !!settings.voice;
+  speech.setLang(settings.lang);
+  render.setLang(settings.lang);
+  demo.rate = settings.demoRate;
+  syncDemo();
+  updateVoiceButton();
+}
+function updateVoiceButton() {
+  const btn = $('btnVoice');
+  btn.textContent = tr(settings.voice ? 'btn.voice.on' : 'btn.voice.off');
+  btn.classList.toggle('on', !!settings.voice);
+}
+function syncDemo() {
+  const on = FORCED_DEMO || (!bridgeLive && settings.demo);
+  demo.quiet = !on;
+  const badge = $('modeBadge');
+  badge.textContent = on ? tr('badge.demo') : tr('badge.live');
+  badge.classList.toggle('live', !on);
+  if (!bridgeLive) {
+    $('bridgeDot').className = 'dot warn';
+    $('bridgeState').textContent = tr('badge.offline');
+  }
+}
+
+// ---------- i18n ----------
+function applyI18n() {
+  document.title = tr('app.title') + ' · AvatarMatch';
+  document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = tr(el.dataset.i18n); });
+  document.querySelectorAll('[data-i18n-ph]').forEach((el) => { el.placeholder = tr(el.dataset.i18nPh); });
+  updateVoiceButton();
+  renderMatchSettings($('settingsBody'), settings, saveSettings);
+  syncDemo();
+  renderFeedDom();
+  renderStats();
+}
+$('btnLang').addEventListener('click', () => {
+  settings.lang = settings.lang === 'en' ? 'zh' : 'en';
+  saveSettings();
+  applyI18n();
+});
+$('btnVoice').addEventListener('click', () => {
+  settings.voice = !settings.voice;
+  if (!settings.voice) speech.stop();
+  saveSettings();
+});
+
+// ---------- 播报 / 事件流 ----------
+function pushFeed(text, kind = 'info') {
+  feedItems.unshift({ text, kind, at: Date.now() });
+  if (feedItems.length > 7) feedItems.pop();
+  renderFeedDom();
+}
+function feedColor(kind) {
+  return kind === 'burst' ? '#ff9fb1' : kind === 'merge' ? '#ffe6a8' : kind === 'gift' ? '#c9a7ff' : '#a9d8ff';
+}
+function renderFeedDom() {
+  const ul = $('events');
+  if (!feedItems.length) {
+    ul.innerHTML = `<li class="dim"><i></i><span>${tr('log.empty')}</span></li>`;
+    return;
+  }
+  ul.innerHTML = feedItems.map((item) => {
+    const cls = item.kind === 'burst' ? 'hot' : item.kind === 'merge' || item.kind === 'gift' ? 'gold' : '';
+    return `<li class="${cls}"><i></i><span>${escapeHtml(item.text)}</span></li>`;
+  }).join('');
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function throttle(key, seconds) {
+  const now = Date.now();
+  if (now - (toastGate.get(key) || 0) < seconds * 1000) return false;
+  toastGate.set(key, now);
+  return true;
+}
+
+// ---------- 互动入口 ----------
+function onBridgeEvent(ev) {
+  if (!ev || !ev.type) return;
+  if (ev.avatar) render.avatar(ev.name, ev.avatar);
+  if (ev.type === 'comment' && ev.text && throttle('comment', 1.6)) {
+    pushFeed(tr('toast.comment', { name: ev.name, text: String(ev.text).slice(0, 24) }), 'comment');
+  }
+  engine.feed(ev);
+}
+
+function handleEvents(events) {
+  for (const ev of events) {
+    if (ev.kind === 'join') {
+      pushFeed(tr('toast.join', { name: ev.name }), 'join');
+      if (throttle('welcome', 4)) speech.welcome(ev.name);
+    } else if (ev.kind === 'gift') {
+      if (ev.tier >= 3) {
+        pushFeed(tr('toast.gift', { name: ev.name, gift: ev.raw }), 'gift');
+        speech.gift(ev.name, ev.raw);
+      }
+    } else if (ev.kind === 'merge') {
+      if (ev.tier >= 4) {
+        pushFeed(tr('toast.merge', { name: ev.name, tier: tierName(ev.tier) }), 'merge');
+        speech.merge(ev.name, tierName(ev.tier));
+      }
+    } else if (ev.kind === 'record') {
+      if (ev.tier >= 5 && throttle('record', 6)) {
+        pushFeed(tr('toast.record', { name: ev.name, tier: tierName(ev.tier) }), 'merge');
+      }
+    } else if (ev.kind === 'pressure') {
+      if (ev.value >= 0.8) {
+        if (throttle('pressure', 8)) {
+          pushFeed(tr('toast.pressure', { pct: Math.round(ev.value * 100) }), 'pressure');
+          speech.pressure(Math.round(ev.value * 100));
+        }
+      }
+    } else if (ev.kind === 'burst') {
+      const breaker = ev.breaker;
+      if (breaker) {
+        board.record({ name: breaker.name, avatar: breaker.avatar, at: Date.now() });
+        pushFeed(tr('toast.burst', { name: breaker.name, n: ev.bottleNo }), 'burst');
+      } else {
+        pushFeed(tr('toast.burstNone'), 'burst');
+      }
+      speech.burst(breaker?.name, ev.bottleNo);
+    } else if (ev.kind === 'bottle') {
+      pushFeed(tr('toast.newBottle'), 'info');
+    }
+  }
+}
+
+// ---------- 直播连接 ----------
+const roomInput = $('room');
+roomInput.value = localStorage.getItem(ROOM_KEY) || '';
+function saveRoom() {
+  const value = roomInput.value.trim();
+  writeJSON(ROOM_KEY, value);
+  if (bridge && value) bridge.setRoom(value.replace(/\D/g, ''));
+  hint(tr('btn.saveRoom') + ' ✓', 'ok');
+}
+function hint(text, kind = '') {
+  const el = $('liveHint');
+  el.textContent = text;
+  el.className = 'hint ' + kind;
+}
+async function callApi(path, okText) {
+  try {
+    const res = await fetch(path, { signal: AbortSignal.timeout(30000) });
+    const payload = await res.json();
+    if (payload.ok) {
+      hint(okText || 'OK', 'ok');
+      if (path.includes('start-bridge') && bridge) bridge.reconnect();
+    } else {
+      hint(payload.error || 'HTTP ' + res.status, 'bad');
+    }
+    return payload;
+  } catch (err) {
+    hint(String(err && err.message || err), 'bad');
+    return null;
+  }
+}
+$('btnSaveRoom').addEventListener('click', saveRoom);
+$('btnOpenLive').addEventListener('click', () => {
+  saveRoom();
+  callApi('/__open-live?room=' + encodeURIComponent(roomInput.value.trim()), tr('btn.openLive') + ' ✓');
+});
+$('btnStartBridge').addEventListener('click', () => {
+  saveRoom();
+  hint(tr('btn.startBridge') + '…', 'warn');
+  callApi('/__start-bridge?room=' + encodeURIComponent(roomInput.value.trim()), tr('btn.startBridge') + ' ✓');
+});
+$('btnStopBridge').addEventListener('click', () => {
+  callApi('/__stop-bridge?force=1', tr('btn.stopBridge') + ' ✓');
+});
+$('btnCloseLive').addEventListener('click', () => {
+  callApi('/__close-live', tr('btn.closeLive') + ' ✓');
+});
+$('btnDiag').addEventListener('click', async () => {
+  hint(tr('btn.diag') + '…');
+  try {
+    const res = await fetch('/__diag', { signal: AbortSignal.timeout(8000) });
+    const diag = await res.json();
+    const lines = [
+      'bridge: ' + (diag.bridge?.ok ? 'OK ' + (diag.bridge.url || '') : 'offline'),
+      'bridgeDir: ' + (diag.bridgeDir || '—'),
+      'bridgeRunning: ' + (diag.bridgeRunning ? 'yes' : 'no'),
+      'liveWindow: ' + (diag.liveWindow?.listening ? 'open' : 'closed'),
+      'liveTab: ' + (diag.liveWindow?.liveTabs?.[0] || '—'),
+      'log: ' + String(diag.logTail || '').split('\n').slice(-3).join(' | ')
+    ];
+    hint(lines.join('\n'), diag.bridge?.ok ? 'ok' : 'warn');
+  } catch (err) {
+    hint(String(err && err.message || err), 'bad');
+  }
+});
+
+// ---------- 按钮 ----------
+$('btnClear').addEventListener('click', () => {
+  engine.clearBottle();
+  pushFeed(tr('toast.clear'), 'info');
+});
+$('btnBurst').addEventListener('click', () => {
+  if (!engine.forceBurst('manual')) return;
+});
+$('btnFullscreen').addEventListener('click', () => {
+  const stage = $('stage');
+  if (document.fullscreenElement) document.exitFullscreen?.();
+  else stage.requestFullscreen?.();
+});
+
+// ---------- 数据面板 ----------
+function renderStats() {
+  const snap = engine.snapshot();
+  const cells = [
+    [snap.stats.drops, tr('data.drop')],
+    [snap.stats.merges, tr('data.merge')],
+    [snap.stats.bursts, tr('data.burst')],
+    [snap.pieces, tr('data.top')],
+    [snap.queued, tr('data.queue')],
+    [snap.bottleNo, tr('data.bottles')]
+  ];
+  $('dataGrid').innerHTML = cells.map(([value, label]) =>
+    `<div class="stat"><b>${Number(value) || 0}</b><span>${escapeHtml(label)}</span></div>`).join('');
+}
+
+// ---------- 主循环 ----------
+let last = performance.now();
+let paused = false;
+function loop(now) {
+  const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
+  last = now;
+  if (!paused) step(dt);
+  requestAnimationFrame(loop);
+}
+
+function step(dt) {
+  if (!demo.quiet) demo.tick(dt);
+  engine.step(dt);
+  const events = engine.drainEvents();
+  if (events.length) {
+    handleEvents(events);
+    render.spawnEffects(events);
+  }
+  const boardRows = board.top(5);
+  render.frame(dt, engine, {
+    board: boardRows,
+    feed: feedItems.slice(0, 4).map((x) => ({ text: x.text, color: feedColor(x.kind) }))
+  });
+  if (performance.now() - lastUi > 500) {
+    lastUi = performance.now();
+    renderStats();
+  }
+}
+
+// 切后台时用定时器补一点时间，回来不会跳帧
+let hiddenTimer = null;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    hiddenTimer = setInterval(() => { for (let i = 0; i < 5; i++) step(0.05); }, 250);
+  } else {
+    clearInterval(hiddenTimer);
+    last = performance.now();
+  }
+});
+
+// ---------- 尺寸 ----------
+function resize() {
+  const rect = $('stage').getBoundingClientRect();
+  render.resize(rect.width, rect.height, Math.min(2, window.devicePixelRatio || 1), true);
+}
+window.addEventListener('resize', resize);
+if (typeof ResizeObserver !== 'undefined') new ResizeObserver(resize).observe($('stage'));
+
+// ---------- 启动 ----------
+applyMatchSettings(settings, engine);
+speech.enabled = !!settings.voice;
+renderMatchSettings($('settingsBody'), settings, saveSettings);
+applyI18n();
+resize();
+
+if (!FORCED_DEMO) {
+  bridge = connectBridge({
+    room: roomInput.value,
+    onEvent: onBridgeEvent,
+    onPeople: (people) => { for (const p of people || []) if (p.avatar) render.avatar(p.name, p.avatar); },
+    onStatus: (status) => {
+      const dot = $('bridgeDot');
+      const state = $('bridgeState');
+      if (status.state === 'live') {
+        bridgeLive = true;
+        dot.className = 'dot live';
+        state.textContent = tr('badge.live') + (status.room ? ' · ' + status.room : '');
+        if (throttle('liveToast', 10)) pushFeed(tr('toast.live'), 'info');
+      } else if (status.state === 'connecting') {
+        dot.className = 'dot warn';
+        state.textContent = tr('badge.offline');
+      } else {
+        bridgeLive = false;
+        dot.className = 'dot bad';
+        state.textContent = 'offline';
+      }
+      syncDemo();
+    }
+  });
+}
+
+if (SHOT) warmup();
+
+function warmup() {
+  // 截图用：先把撑破榜跑真（真的炸三瓶），再摆一个半满的场面停下。
+  const rng = makeRng(20260218);
+  const names = DEMO_NAMES;
+  const pick = (list) => list[Math.floor(rng() * list.length) % list.length];
+  const saved = { spawnPerSec: engine.cfg.spawnPerSec, burstFill: engine.cfg.burstFill };
+  const feedOne = () => {
+    const roll = rng();
+    if (roll < 0.42) engine.feed({ type: 'like', name: pick(names), count: 1 + Math.floor(rng() * 12) });
+    else if (roll < 0.66) engine.feed({ type: 'comment', name: pick(names) });
+    else if (roll < 0.8) engine.feed({ type: 'gift', name: pick(names), raw: pick(['小心心', '玫瑰']), gift: 'other' });
+    else if (roll < 0.94) engine.feed({ type: 'join', name: pick(names) });
+    else engine.feed({ type: 'follow', name: pick(names) });
+  };
+
+  Object.assign(engine.cfg, { spawnPerSec: 26, burstFill: 0.55 });
+  let bursts = 0;
+  for (let g = 0; g < 60 * 70 && bursts < 3; g++) {
+    if (rng() < 0.12) feedOne();
+    engine.step(1 / 60);
+    if (engine.state === 'bursting') {
+      const ev = engine.drainEvents().find((x) => x.kind === 'burst');
+      if (ev?.breaker) board.record({ name: ev.breaker.name, at: Date.now() });
+      bursts += 1;
+      for (let i = 0; i < 90 && engine.state === 'bursting'; i++) engine.step(1 / 60);
+    }
+  }
+
+  engine.reset();
+  Object.assign(engine.cfg, saved);
+  for (let i = 0; i < 12; i++) engine.feed({ type: 'comment', name: '榜一大哥' });
+  for (let i = 0; i < 3; i++) engine.feed({ type: 'gift', name: '榜一大哥', raw: '火箭', gift: 'other' });
+  for (let g = 0; g < 60 * 30; g++) {
+    if (rng() < 0.07) feedOne();
+    engine.step(1 / 60);
+    if (engine.state === 'bursting') break;
+    if (g > 60 * 8 && engine.pieces.length >= 46 && engine.pressure >= 0.4) break;
+  }
+  engine.drainEvents();
+  render.toast(tr('toast.merge', { name: '榜一大哥', tier: tierName(6) }), 'merge', 8);
+  render.toast(tr('toast.join', { name: '新来的朋友' }), 'join', 8);
+}
+requestAnimationFrame(loop);
+
+// 开发/截图/验收用：页面内自检与控制
+globalThis.__match = {
+  engine,
+  render,
+  board,
+  demo,
+  settings,
+  snapshot: () => engine.snapshot(),
+  pause() { paused = true; },
+  resume() { paused = false; last = performance.now(); },
+  advance(dt = 1 / 30) { step(Math.min(0.05, Number(dt) || 0.03)); },
+  burst() { return engine.forceBurst('manual'); }
+};
+</script>
+</body>
+</html>
